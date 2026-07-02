@@ -1,55 +1,111 @@
-# 测试计划 — 无线通信基带仿真系统
+# 测试计划 — 无线通信基带仿真系统（高标准重做）
 
-## 1. 测试概述
+## 1. 测试金字塔
 
-本测试计划覆盖系统的**模块级测试**和**端到端集成测试**，确保每个功能模块正确工作，整个通信链路在指定 SNR 条件下能 100% 恢复原始文本。
-
-## 2. 测试用例
-
-### 2.1 结构文档测试（TC-T-001 ~ TC-T-003, TC-T-018 ~ TC-T-020）
-
-| 用例 | 描述 | 预期结果 |
-|------|------|----------|
-| TC-T-001 | 必需项目文件存在 | DESIGN.md, TEST_PLAN.md, MOCK_TEST_REPORT.md, AI_LOG.md, main.py, src/, tests/ 全部存在 |
-| TC-T-002 | DESIGN.md 覆盖系统链路 | 包含 Source Encode, Encrypt, Scramble, Channel Encode, Frame Build, QPSK 等关键词 |
-| TC-T-003 | MOCK_TEST_REPORT.md 包含修订记录 | ≥3 个 mock 测试、≥1 个风险/缺陷、修订记录 |
-| TC-T-018 | AI_LOG.md 记录 AI 协助 | ≥3 次 prompt、人工修改、采纳理由 |
-| TC-T-019 | 报告解释结果 | QPSK 星座图、BER、text_match_rate、失败原因 |
-| TC-T-020 | 无反复制快捷方式 | 代码中无 shutil.copy 等可疑模式 |
-
-### 2.2 模块级测试（TC-T-004 ~ TC-T-012）
-
-| 用例 | 描述 | 测试方法 |
-|------|------|----------|
-| TC-T-004 | UTF-8 信源编解码可逆 | 编码→解码恢复原文，比特数 8 整除 |
-| TC-T-005 | 帧包含必要字段 | 帧含 preamble, length, payload, checksum |
-| TC-T-006 | 组帧/解析可逆 | build_frame → parse_frame 恢复 payload |
-| TC-T-007 | 加扰/解扰可逆 | scramble → descramble 恢复原始比特 |
-| TC-T-008 | 信道编码无噪声可逆 | encode → decode 恢复原始比特 |
-| TC-T-009 | QPSK 象限映射正确 | 00→Q1, 01→Q2, 11→Q3, 10→Q4，单位功率 |
-| TC-T-010 | QPSK 无噪声零误码 | modulate → demodulate 无误码 |
-| TC-T-011 | QPSK padding 正确 | 奇数长度 payload 正确处理 |
-| TC-T-012 | AWGN 可重现 | 相同 seed 输出相同 |
-
-### 2.3 端到端测试（TC-T-013 ~ TC-T-017）
-
-| 用例 | 描述 | 测试方法 |
-|------|------|----------|
-| TC-T-013 | 同步检测偏移 | 25 符号偏移检测误差 ≤1 |
-| TC-T-014 | metrics.json 字段完整 | 包含所有必需字段 |
-| TC-T-015 | 端到端文本恢复 | SNR=12dB 时 text_match_rate == 1.0 |
-| TC-T-016 | 生成至少 2 张图 | constellation.png, ber_curve.png, sync_peak.png 中 ≥2 存在 |
-| TC-T-017 | CLI 非交互式运行 | 20 秒内完成，无交互提示 |
-
-## 3. 测试运行
-
-```bash
-PYTHONPATH=. pytest public_tests/ -v
+```
+        ┌─────────────┐
+        │   E2E (e2e)  │  不同文本/SNR/seed/偏移/异常 CLI/metrics/图集
+        ├─────────────┤
+        │ Integration  │  相邻模块串联可逆性
+        ├─────────────┤
+        │   Property   │  hypothesis 随机化性质测试（可逆/检错/可复现）
+        ├─────────────┤
+        │    Unit      │  每模块可逆性/边界/数值容差/异常
+        └─────────────┘
 ```
 
-## 4. 测试策略
+| 层 | 目录 | 内容 |
+|----|------|------|
+| Unit | `tests/unit/` | 每模块独立测试，覆盖正常/边界/异常 |
+| Property | `tests/property/` | hypothesis 随机输入验证不变式 |
+| Integration | `tests/integration/` | 相邻模块串联 |
+| E2E | `tests/e2e/` | 端到端 CLI + 不同参数 |
 
-- **单元测试**：每个模块独立测试编解码可逆性
-- **集成测试**：端到端完整链路测试
-- **边界测试**：奇数长度 payload、不同 SNR 值
-- **可重现性测试**：固定种子确保结果一致
+教师公开测试 `public_tests/` 不修改，作为回归基线。
+
+## 2. 每模块单元测试场景
+
+| 模块 | 必测场景 |
+|------|----------|
+| source | 空文本→[]→""；中文/ASCII/emoji 可逆；比特数%8==0；非法 UTF-8 字节 errors=replace |
+| crypto | 任意比特加解扰可逆；不同 seed 输出不同；同 seed 可复现；空比特；别名等价 |
+| channel_coding | 无噪可逆；3 比特组错 1 纠、错 2 判错；非 3 倍数容错；空输入；CODING_SCHEMES 注册 |
+| framing | build→parse 可逆（偶/奇/极短/1bit）；CRC 翻 1bit→crc_valid=False；length 截 padding；帧总长=50+16+N+16；crc_valid 真实；不抛异常 |
+| modulation | 4 比特对映射象限正确；单位功率∈[0.8,1.2]；奇数补0；无噪零误码；MODULATION_SCHEMES 注册；别名等价 |
+| channel | 同 seed 可复现(allclose)；不同 seed 不同；SNR↑噪声↓(单调)；噪声方差=Es/snr/2 每维；CHANNEL_SCHEMES 注册 |
+| synchronization | 25 偏移检测±1；无帧 found=False 但 start_index 仍返回；FFT 与循环结果一致；周期 preamble 不误杀；confidence 合理 |
+| metrics | ber 0/全错/部分；fer 单帧 crc 真/假、多帧失败比例；text_match 全等/部分/空；checksum_pass 比对 |
+
+## 3. Property-based 测试（hypothesis）
+
+| 性质 | 策略 | 断言 |
+|------|------|------|
+| 信源可逆 | `st.text()` 任意 UTF-8 | `decode(encode(t))==t` |
+| 加扰可逆 | `st.lists(st.integers(0,1))` + `st.integers()` seed | `descramble(scramble(b,s),s)==b` |
+| 重复码可逆 | 任意比特 | `decode(encode(b))==b` |
+| QPSK 无噪零误码 | 偶数比特 | `demod(mod(b))==b` |
+| CRC 单 bit 检错 | 任意 payload + 翻 1 bit | `crc_valid==False` |
+| 帧 build→parse 还原 | 任意 payload | payload 还原、length==len |
+| AWGN 可复现 | 固定 seed | 两次 allclose |
+
+## 4. 端到端测试
+
+- 不同中文文本（短/长/含 ASCII/emoji）
+- 不同 SNR（0/6/12/18 dB）
+- 不同 seed（2026/2027/随机）
+- 随机同步偏移（前缀噪声符号 0~50）
+- 空文本、1 字符极短
+- 低 SNR（BER>0 且 text_match<1）
+- 错误 CLI（`--mod foo`/`--channel bar` 非零退出）
+- metrics.json 字段与值校验（含新字段 crc_valid/sync_confidence）
+- 图集文件存在性（≥6 张 + 旧 3 名）
+
+## 5. 覆盖率门禁（不污染 CI）
+
+**关键约束**：CI（`grading.yml`）跑 `pytest public_tests -q`，无 `--no-cov`。因此覆盖率门禁**不能**写进 `pyproject.toml` 全局 `addopts`，否则 CI 跑 public_tests 时也触发 cov 门禁，public_tests 对 src 覆盖率不足 90% 会挂 CI。
+
+策略：
+- `pyproject.toml` 只配 `[tool.coverage.run]`/`[tool.coverage.report]`，**不**配 `[tool.pytest.ini_options].addopts`。
+- 覆盖率门禁靠本地命令显式触发：
+  ```bash
+  pytest tests --cov=src --cov=main --cov-fail-under=90 --cov-report=term-missing --cov-report=html
+  ```
+- 目标：`src/` + `main.py` 行覆盖率 ≥ 90%。
+
+## 6. 红绿重构执行顺序（依赖拓扑）
+
+```
+source → crypto → channel_coding → framing → modulation → channel → synchronization → metrics → main
+```
+
+每模块循环：
+1. 写失败 unit 测试（红）
+2. 最小实现（绿）
+3. 重构（去冗余 + 类型标注 + docstring）
+4. `pytest tests/unit/test_<mod> --cov=<mod>` 覆盖率 ≥ 90%
+5. `pytest public_tests -q` 回归（保绿）
+
+## 7. 公开测试回归策略
+
+- 每完成一模块，**立即** `pytest public_tests -q`；红则定位碰了哪条红线（接口名/映射/字段），回退。
+- git 分支 `feature/redesign`，每模块绿后 commit，回归时 `git diff` 缩范围。
+- `conftest.py` 的 `SAMPLE_TEXT` 为端到端 fixture，学生测试复用同源文本。
+
+## 8. 测试运行命令
+
+```bash
+# 公开测试（红线，CI 同款）
+pytest public_tests -q
+
+# 学生测试 + 覆盖率门禁（本地）
+pytest tests --cov=src --cov=main --cov-fail-under=90 --cov-report=term-missing
+
+# 单模块快速迭代
+pytest tests/unit/test_framing.py -v
+
+# Mock 设计验证
+PYTHONPATH=. python mock/verify_design.py
+
+# 端到端
+python main.py --input Test.txt --output results/received.txt --snr 12 --seed 2026 --mod qpsk --channel awgn
+```

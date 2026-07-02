@@ -1,185 +1,265 @@
 # 系统设计文档 — 无线通信基带仿真系统
 
+> **Spec freeze v1**（2026-07-02）。本文档为重做后的冻结规约。阶段 4 起任何接口/数值约定变更须在下方"变更记录"表留痕，并同步 MOCK_TEST_REPORT.md。
+
+## 变更记录
+
+| 版本 | 日期 | 变更点 | 原因 | 影响模块 |
+|------|------|--------|------|----------|
+| v1 | 2026-07-02 | 初次冻结（高标准重做规约） | 修复 8 条硬伤 + 2 条新发现 | 全部 |
+
+---
+
 ## 1. 系统概述
 
-本系统实现了一个完整的**无线通信基带仿真链路**，将 UTF-8 中文文本编码为比特流，经过发射端处理、信道传输、接收端处理后恢复原始文本。
+本系统实现一个完整的**无线通信基带仿真链路**，将 UTF-8 中文文本编码为比特流，经过发射端处理、信道传输、接收端处理后恢复原始文本。重做目标：每个环节"真实正确"（指标非写死、CRC 真验证、CLI 真生效、BER 曲线与端到端一致），配 TDD + 覆盖率门禁 + 中英双语可视化。
 
 ## 2. 系统链路
-
-整个通信链路按以下顺序处理：
 
 ```
 [文本输入] → Source Encode → Scramble/Encrypt → Channel Encode
     → Frame Build → QPSK Modulate → AWGN Channel
     → Synchronization → QPSK Demodulate → Frame Parse
     → Channel Decode → Descramble/Decrypt → Source Decode → [文本输出]
+                                          → Metrics / Plots
 ```
 
-### 2.1 Source Encode（信源编码）
+## 3. 模块规约
 
-将 UTF-8 中文文本编码为比特流。每个字符先 UTF-8 编码为字节，每个字节拆为 8 个比特。比特流长度总是 8 的倍数。
+### 3.1 Source Encode（信源编码）— `src/source.py`
 
-- 模块：`src/source.py`
-- 函数：`source_encode(text)` → `source_decode(bits)`
+```python
+def source_encode(text: str) -> list[int]      # UTF-8→字节→MSB-first 比特，长度恒为 8 倍数
+def source_decode(bits: list[int]) -> str       # 8 位分组→字节→UTF-8 解码（errors="replace"）
+```
+- **边界**：`source_encode("")` → `[]`；`source_decode([])` → `""`。
+- **可逆性**：对任意 UTF-8 文本 `t`，`source_decode(source_encode(t)) == t`。
+- **别名**：`text_to_bits`、`bits_to_text`（保留，公开测试用）。
+- **为什么**：原实现已正确，仅补类型标注与空文本显式处理，避免下游 `len([])` 除零。
 
-### 2.2 Scramble / Encrypt（加扰/加密）
+### 3.2 Scramble / Encrypt（加扰/解扰）— `src/crypto.py`
 
-使用基于 PRNG（`numpy.random.default_rng(seed)`）生成的伪随机比特序列，与信源编码输出进行 XOR 操作，实现比特级可逆加扰。
+```python
+def scramble(bits: list[int], seed: int = 2026) -> list[int]
+def descramble(bits: list[int], seed: int = 2026) -> list[int]
+```
+- **规约**：`rng = np.random.default_rng(seed)`，生成与 `bits` 等长伪随机比特 `r`，输出 `b XOR r`。XOR 自逆 ⇒ `descramble(scramble(b, s), s) == b` 对任意 `s`。
+- **seed 来源**：CLI `--seed`，收发两端必须一致。
+- **声明**：本模块是**加扰（能量扩散）而非加密**——PRNG 可逆、种子公开，仅用于打散长串 0/1 以利于同步与均衡，不具备保密性。
+- **别名**：`scramble_bits`/`descramble_bits`/`encrypt`/`decrypt`/`encrypt_bits`/`decrypt_bits`（保留）。
 
-- 模块：`src/crypto.py`
-- 函数：`scramble(bits, seed)` → `descramble(bits, seed)`
+### 3.3 Channel Encode（信道编码）— `src/channel_coding.py`
 
-### 2.3 Channel Encode（信道编码）
+```python
+def channel_encode(bits: list[int]) -> list[int]      # (3,1) 重复码，每比特×3，编码率 1/3
+def channel_decode(coded: list[int]) -> list[int]      # 每 3 比特多数投票（sum≥2→1）
+CODING_SCHEMES: dict[str, tuple[Callable, Callable]] = {"rep3": (channel_encode, channel_decode)}
+```
+- **可逆性**：无噪声下 `channel_decode(channel_encode(b)) == b`。
+- **容错**：3 比特组错 1 可纠，错 2 判错。
+- **可插拔**：为 Level3 汉明(7,4) 留 `CODING_SCHEMES["hamming74"]` 注册点，main.py 按 `--code` 选（默认 `rep3`）。
+- **别名**：`encode`/`decode`/`encode_bits`/`decode_bits`/`fec_encode`/`fec_decode`（保留）。
 
-采用 (3,1) 重复码进行前向纠错（FEC）。每个比特重复 3 次传输，接收端通过多数投票解码。编码率 = 1/3，提供较强的纠错能力。
+### 3.4 Frame Build（组帧）★重点 — `src/framing.py`
 
-- 模块：`src/channel_coding.py`
-- 函数：`channel_encode(bits)` → `channel_decode(bits)`
+```python
+def build_frame(payload_bits: list[int]) -> dict
+    # 返回 {preamble, length, payload, checksum, bits, crc_valid: True}
 
-### 2.4 Frame Build（组帧）
+def parse_frame(frame, *, verify_crc: bool = True) -> dict
+    # 返回 {preamble, length, payload, checksum, crc_valid: bool, crc_mismatch: bool}
+    # verify_crc=True 时重算 CRC 并与帧尾比对，置 crc_valid；不抛异常（best-effort 解码）
+```
 
-帧结构设计：
-| 字段 | 长度 | 说明 |
-|------|------|------|
-| Preamble | 50 bits (25 QPSK 符号) | 同步用已知序列 |
-| Length | 16 bits | Payload 比特数 |
-| Payload | 可变 | 编码后的数据 |
-| Checksum | 16 bits | CRC-16 校验 |
+帧字段固化（不可变）：
 
-- 模块：`src/framing.py`
-- 函数：`build_frame(payload)` → `parse_frame(frame)`
+| 字段 | 比特 | 偏移 | 说明 |
+|------|------|------|------|
+| Preamble | 50 | 0 | 25 QPSK 符号，`rng=default_rng(42)` 伪随机，保持 `PREAMBLE_SYMBOLS`/`PREAMBLE_BITS` |
+| Length | 16 | 50 | 大端，payload 比特数 |
+| Payload | N | 66 | 信道编码后比特 |
+| CRC-16 | 16 | 66+N | CRC-CCITT（poly 0xA001, init 0xFFFF），覆盖 PREAMBLE+Length+Payload |
 
-### 2.5 QPSK Modulate / Demodulate（调制/解调）
+- **CRC 真实验证**（修复硬伤#4）：`parse_frame` 重算 `_crc16(received_preamble + length + payload)`，与接收 checksum 比对 → `crc_valid`。**不抛异常**——保 TC-T_006/011 在噪声下也能返回 payload 供测试断言；main.py 用 `crc_valid` 算真 FER。
+- **padding**：QPSK 奇数比特补 0 由 modulation 负责；parse_frame 一律按 Length 截取 payload，丢弃尾部 padding 与多余位。
+- **为什么**：原 `parse_frame:104` 只提 checksum 不验，纠错检错能力为零。改为返回标志而非抛异常，兼顾"真实验证"与"测试可断言"。
 
-采用 Gray 编码 QPSK 调制，比特对到星座点映射如下：
+### 3.5 QPSK Modulate / Demodulate（调制/解调）— `src/modulation.py`
 
-| 比特对 | 象限 | 复数符号 |
-|--------|------|----------|
-| 00 | Q1 | (1+1j)/√2 |
-| 01 | Q2 | (-1+1j)/√2 |
-| 11 | Q3 | (-1-1j)/√2 |
-| 10 | Q4 | (1-1j)/√2 |
+```python
+def qpsk_modulate(bits: list[int]) -> np.ndarray[complex]      # 奇数补 0，单位功率
+def qpsk_demodulate(symbols: np.ndarray[complex]) -> list[int]
+MODULATION_SCHEMES = {"qpsk": (qpsk_modulate, qpsk_demodulate)}
+```
 
-符号平均功率为 1（单位功率）。奇数比特时自动补 0。
+Gray 编码映射表（`QPSK_MAP`，**红线不可改**，TC-T_009）：
 
-- 模块：`src/modulation.py`
-- 函数：`qpsk_modulate(bits)` → `qpsk_demodulate(symbols)`
+| 比特对 | 象限 | 复数 |
+|--------|------|------|
+| (0,0) | Q1 | (1+1j)/√2 |
+| (0,1) | Q2 | (-1+1j)/√2 |
+| (1,1) | Q3 | (-1-1j)/√2 |
+| (1,0) | Q4 | (1-1j)/√2 |
 
-### 2.6 Channel（AWGN 信道）
+- **解调规则**（已验证正确）：`b0 = 1 if s.imag<0 else 0`（看虚部），`b1 = 1 if s.real<0 else 0`（看实部）。
+- **单位功率**：每符号 |s|²=1，平均功率=1（断言 ∈[0.8,1.2]）。
+- **可插拔**：为 BPSK/16QAM 留 `MODULATION_SCHEMES` 注册点；默认仅实现 qpsk（Level2 稳）。main.py 按 `--mod` 查表，未注册值 `sys.exit(报错)`。
+- **别名**：`modulate_qpsk`/`demodulate_qpsk`/`qpsk_mapper`/`qpsk_demapper`/`modulate`/`demodulate`（保留）。
 
-模拟加性高斯白噪声信道。根据指定的 SNR（dB）和信号功率计算噪声方差，生成复高斯噪声叠加到信号上。使用固定随机种子确保可重现性。
+### 3.6 Channel（AWGN 信道）— `src/channel.py`
 
-- 模块：`src/channel.py`
-- 函数：`awgn(symbols, snr_db, seed)`
+```python
+def awgn(symbols: np.ndarray[complex], snr_db: float = 12, seed: int = 2026) -> np.ndarray[complex]
+CHANNEL_SCHEMES = {"awgn": awgn}
+```
 
-### 2.7 Synchronization（同步）
+**SNR 定义（必须明确，修复硬伤#7）**：`snr_db` 为 **Es/N0（符号信噪比）**。
+- `signal_power = mean(|s|²) = Es`
+- `noise_power = Es / 10^(snr_db/10)`
+- 复噪声实/虚部各 `N(0, √(noise_power/2))`，总方差 = `noise_power`
+- BER 曲线横轴用 **Eb/N0 = Es/N0 − 10·log10(k)**，QPSK k=2 ⇒ **Eb/N0 = snr_db − 3 dB**
 
-使用互相关峰值检测法。接收端已知 Preamble 符号序列，对接收信号滑动计算互相关（取共轭匹配滤波），峰值位置即为帧起始索引。
+- **可复现**：`rng = np.random.default_rng(seed)`，同 seed 同输出（TC-T_012 红线）。
+- **可插拔**：为 Level3 Rayleigh 留 `CHANNEL_SCHEMES["rayleigh"]`，main.py 按 `--channel` 选，未注册报错退出。
+- **别名**：`awgn_channel`/`add_awgn`/`add_noise`（保留）。
 
-- 模块：`src/synchronization.py`
-- 函数：`synchronize(received, preamble)`
+### 3.7 Synchronization（同步）★重点 — `src/synchronization.py`
 
-### 2.8 Channel Decode（信道解码）
+```python
+def synchronize(received, preamble=None, *, threshold_ratio: float = 0.3) -> dict
+    # 返回 {
+    #   start_index: int,      # 始终返回 argmax（保 TC-T_013 红线）
+    #   confidence: float,     # peak / (|preamble|·E[|r|])
+    #   peak: float,
+    #   found: bool,           # peak >= threshold_ratio * (|preamble|·E[|r|])
+    # }
+```
+- **阈值**：`found = peak >= threshold_ratio * (|preamble|·E[|r|])`（相对阈值，默认 0.3）。`start_index` 恒为 argmax，**不因阈值拒绝返回**（保 TC-T_013 周期 preamble 也能给起点）。
+- **无帧处理**：`found=False` 时 main.py 仍尽力解调，FER=1、`sync_confidence` 如实报告。
+- **FFT 加速**：用 `scipy.signal.correlate(received, conj(preamble), method='fft')` 替换原 O(n·m) Python 循环；原循环保留为 fallback（测试用）。
+- **为什么**：原实现无阈值、无无帧分支、O(n·m) 慢（硬伤#5）。`found` 给 main.py 算真 FER 的依据；FFT 把数千符号同步降到一次性卷积。
+- **别名**：`detect_frame_start`/`find_preamble`/`sync`（保留）。
 
-(3,1) 重复码的多数投票解码。每 3 个比特一组，取多数值作为解码结果。
+### 3.8 Channel Decode（信道解码）— `src/channel_coding.py`
 
-### 2.9 Source Decode（信源解码）
+(3,1) 重复码多数投票，每 3 比特一组 `sum≥2→1`。见 §3.3。
 
-将比特流按 8 位一组恢复为字节，再 UTF-8 解码为中文文本。
+### 3.9 Source Decode（信源解码）— `src/source.py`
 
-### 2.10 Metrics（指标计算）
+比特流按 8 位一组恢复字节，UTF-8 解码（errors="replace"）。见 §3.1。
 
-计算并输出：
-- **BER**（比特错误率）：错误比特数 / 总比特数
-- **FER**（帧错误率）：0 或 1
-- **text_match_rate**：恢复文本与原始文本的字符匹配率
-- **checksum_pass**：CRC 校验结果
-- **sync_start_index**：同步检测到的帧起始位置
+### 3.10 Metrics（指标计算，真实化）★重点 — `src/metrics.py`
 
-## 3. 数据流推演
+```python
+def compute_ber(original_bits, received_bits) -> float
+def compute_fer(crc_valid: bool | list[bool]) -> float       # 新增：单帧 0/1，多帧 failed/total
+def compute_text_match_rate(original_text, received_text) -> float
+def compute_checksum_pass(tx_checksum, rx_checksum) -> bool   # 已存在，main.py 真正调用
+```
+- **FER 真实化**（修复硬伤#2）：单帧 `fer = 0.0 if crc_valid else 1.0`；多帧扫描 `failed/total`。**不再** `0.0 if ber==0.0 else 1.0`。
+- **checksum_pass**（修复硬伤#3）：main.py 调用 `compute_checksum_pass` 或直接用 `crc_valid`。
 
-以 Test.txt（262 字符中文，UTF-8 编码后 766 字节）为例，推演比特数变化链，验证收发两端能对齐：
+### 3.11 main.py（CLI 真正生效 + 真实曲线 + 工厂选路）★重点
+
+- **工厂选路**（修复硬伤#1，替换 main.py:125,129 硬编码）：
+  ```python
+  mod_fn, demod_fn = MODULATION_SCHEMES[args.mod]   # KeyError → sys.exit(报错)
+  channel_fn = CHANNEL_SCHEMES[args.channel]
+  tx_symbols = mod_fn(frame_bits)
+  rx_noisy = channel_fn(tx_symbols, args.snr, args.seed)
+  ```
+- **metrics 真实化**（替换 main.py:168,181）：
+  ```python
+  parsed = parse_frame(rx_bits)
+  crc_valid = parsed["crc_valid"]
+  ber = compute_ber(payload_bits, recovered_bits)
+  fer = 0.0 if crc_valid else 1.0
+  checksum_pass = crc_valid
+  # 新增字段（不破坏 TC-T_014）：sync_confidence, crc_valid, eb_n0_db
+  ```
+- **BER 曲线真实化**（修复硬伤#6,7，替换 main.py:52-74）：删另造 4000bit；对**真实帧**在 SNR∈{0,2,4,6,8,10,12,14} dB 各跑完整链路，记录端到端 BER/FER。横轴 **Eb/N0 = snr_db − 3**。叠加：理论未编码 QPSK `0.5·erfc(√(Eb/N0))`、理论 (3,1) 重复码 BER。
+- **generate_plots 重构**：模块顶部 `import matplotlib`（去函数内 import）；新增图集函数；每图 try/except 包裹（一图失败不阻断）。
+
+## 4. SNR 与 BER 约定（本次重做核心修正）
+
+- `channel.py` 的 `snr_db` = **Es/N0**（符号信噪比）。
+- BER 曲线横轴 = **Eb/N0** = Es/N0 − 10·log10(bits_per_symbol)；QPSK 每符号 2 比特 ⇒ Eb/N0 = snr_db − 3 dB。
+- 理论未编码 QPSK BER（AWGN）= `0.5 · erfc(√(Eb/N0_linear))`，其中 `Eb/N0_linear = 10^((snr_db−3)/10)`。
+- 原 main.py:58 用 `0.5·erfc(√(10^(snr_db/10)))` 把 Es/N0 当 Eb/N0，导致理论线左移 3dB、实测点"挂在曲线之上"。本次修正。
+
+## 5. 数据流推演（M8 验证，用 conftest SAMPLE_TEXT 实际值）
+
+输入 `SAMPLE_TEXT`（UTF-8 编码 = 193 字节，与 metrics.json `payload_bits=1544` 吻合，193×8=1544）：
 
 | 阶段 | 计算 | 比特/符号数 |
 |------|------|-----------|
-| Source Encode | 766 字节 × 8 | 6128 bit |
-| Scramble | 长度不变 | 6128 bit |
-| Channel Encode (3,1) | × 3 | 18384 bit |
-| Frame Build | + 50(前导) + 16(长度) + 16(CRC) | 18466 bit |
-| QPSK Modulate | ÷ 2（偶数，无需补 0） | 9233 符号 |
-| AWGN Channel | 长度不变 | 9233 符号 |
+| Source Encode | 193 字节 × 8 | 1544 bit |
+| Scramble | 长度不变 | 1544 bit |
+| Channel Encode (3,1) | × 3 | 4632 bit |
+| Frame Build | + 50 + 16 + 16 | 4714 bit |
+| QPSK Modulate | ÷ 2（偶数，无需补 0） | 2357 符号 |
+| AWGN Channel | 长度不变 | 2357 符号 |
 | Synchronization | 定位起点 | — |
-| QPSK Demodulate | × 2 | 18466 bit |
-| Frame Parse | − 50 − 16 − 16 | 18384 bit |
-| Channel Decode | ÷ 3（多数投票） | 6128 bit |
-| Descramble | 长度不变 | 6128 bit |
-| Source Decode | ÷ 8 | 766 字节 → 文本 |
+| QPSK Demodulate | × 2 | 4714 bit |
+| Frame Parse | − 50 − 16 − 16 | 4632 bit |
+| Channel Decode | ÷ 3（多数投票） | 1544 bit |
+| Descramble | 长度不变 | 1544 bit |
+| Source Decode | ÷ 8 | 193 字节 → 文本 |
 
-> 收发两端比特数完全对齐（6128 → 6128），证明帧结构长度字段能正确剥离 padding，链路逻辑闭环。
+收发两端比特数完全对齐（1544 → 1544），帧结构 Length 字段能正确剥离 padding，链路逻辑闭环。
 
-## 4. 预期风险
+> 旧版 DESIGN 写"262字符/766字节/6128bit"为陈旧错误，本次修正为 193 字节/1544 bit。
 
-提前列设计风险，供 mock 阶段验证。每个风险写：现象 + 根因 + 缓解。
+## 6. 可视化规约（中英双语，数据绑定真实链路）
 
-### 风险 1：前导序列自相关伪峰值
-- **现象**：BER≈0.5，同步检测到的起始位置远偏真实起点
-- **根因**：若用周期性序列（如 `[1+1j,-1+1j,...]` 循环），其循环移位与自身高度相关，自相关到处是峰
-- **缓解**：用独立种子生成的伪随机 QPSK 符号作前导，保证自相关尖锐单峰（mock 阶段用 3 行脚本算自相关验证）
+| 图 | 文件名 | 数据来源 |
+|----|--------|----------|
+| 收发星座图对比 | `constellation.png`（旧名保留） | 真实 tx_symbols 与 rx_from_sync |
+| BER/FER vs Eb/N0 | `ber_curve.png`（旧名保留） | 真实多 SNR 扫描 + 理论线 |
+| 同步互相关峰+阈值 | `sync_peak.png`（旧名保留） | 真实 rx_noisy 与 PREAMBLE 互相关 |
+| 帧结构时序图 | `frame_structure.png` | build_frame 字段 |
+| 误码位置热力图 | `error_pattern.png` | 真实低 SNR(2dB) tx vs rx |
+| 信道噪声分布 | `channel_response.png` | awgn 噪声样本直方图+理论高斯 |
 
-### 风险 2：QPSK 解调判决规则错误
-- **现象**：无噪声下调制→解调就有大量比特错误（应 0 个）
-- **根因**：`b0`/`b1` 到底由实部还是虚部决定容易搞混
-- **缓解**：mock 阶段手推 4 种比特对的调制→解调闭环，明确规则（`b0` 看虚部符号，`b1` 看实部符号）
+标题 `中 / English`；轴标 `同相分量 In-Phase (I)`；`rcParams['font.sans-serif']=['Arial Unicode MS','Noto Sans CJK SC']`。
 
-### 风险 3：低 SNR 下 (3,1) 重复码纠错能力不足
-- **现象**：SNR < 3 dB 时 BER 过高，无法恢复文本
-- **根因**：(3,1) 重复码仅能纠单比特错误，低 SNR 下 3 中错 2 概率上升
-- **缓解**：实际验收在 SNR=12 dB 运行，该 SNR 下重复码绰绰有余；若需更低 SNR 可换汉明/卷积码
+## 7. 预期风险（供 mock 阶段验证）
 
-### 风险 4：奇数比特 padding 处理
-- **现象**：QPSK 调制时奇数比特补 0，接收端若不按 Length 字段剥离会多出 padding 比特
-- **根因**：padding 比特混入 payload 导致后续解码错位
-- **缓解**：帧结构用 Length 字段精确标明 payload 比特数，parse 时按 Length 截取
+| # | 风险 | 现象 | 根因 | 缓解 | Mock 点 |
+|---|------|------|------|------|---------|
+| R1 | QPSK 解调规则搞反 | 无噪下大量误码 | b0/b1 实虚部搞混 | 手推 4 对闭环 | M1/M2 |
+| R2 | 前导自相关伪峰 | 同步偏真起点 | 周期序列循环相关 | 伪随机 preamble | M3 |
+| R3 | CRC 只生不验 | 检错能力为零 | parse_frame 不重算 | parse_frame 重算+返回 crc_valid | M4 |
+| R4 | padding 误判 | 多出 padding 比特 | 不按 Length 截 | parse_frame 按 Length 截 | M5 |
+| R5 | 同步阈值误杀周期 preamble | TC-T_013 失败 | 阈值拒绝返回 | start_index 恒 argmax，阈值仅附加 | M6 |
+| R6 | BER 理论线 3dB 错 | 实测点挂曲线之上 | Es/N0 当 Eb/N0 | 横轴 Eb/N0=snr−3 | M7 |
+| R7 | 低 SNR 重复码不足 | SNR<3dB BER 过高 | (3,1) 仅纠单错 | 验收 SNR=12；可选汉明码 | — |
+| R8 | 收发比特数不对齐 | 解码错位 | 数据流推演错 | 用实际 193 字节核对 | M8 |
 
-### 风险 5：AWGN 复噪声方差分配
-- **现象**：噪声功率偏大或偏小，SNR 不准
-- **根因**：复噪声实部、虚部方差分配错误（应各为 noise_power/2）
-- **缓解**：明确公式 noise_std = √(signal_power / 10^(snr/10) / 2)，固定种子保证可复现
-
-## 5. 文件结构
+## 8. 文件结构
 
 ```
 wireless-final-project-template/
-├── main.py              # CLI 统一入口
-├── DESIGN.md            # 本文件
-├── TEST_PLAN.md         # 测试计划
-├── MOCK_TEST_REPORT.md  # Mock 测试报告
+├── main.py              # CLI 统一入口（工厂选路 + 真实曲线）
+├── DESIGN.md            # 本文件（spec freeze v1）
+├── hard_constraints.md  # 硬约束清单（阶段1产出）
+├── TEST_PLAN.md         # 测试计划（金字塔 + 覆盖率门禁）
+├── MOCK_TEST_REPORT.md  # Mock 测试报告（M1-M8）
 ├── AI_LOG.md            # AI 使用日志
-├── src/
-│   ├── __init__.py
-│   ├── source.py        # 信源编码
-│   ├── crypto.py        # 加扰/解扰
-│   ├── channel_coding.py # 信道编码
-│   ├── framing.py       # 组帧/解析
-│   ├── modulation.py    # QPSK 调制/解调
-│   ├── channel.py       # AWGN 信道
-│   ├── synchronization.py # 同步
-│   └── metrics.py       # 指标计算
-├── tests/               # 学生自测
-├── public_tests/        # 公开测试（20 个用例）
-└── results/             # 输出目录
+├── ANALYSIS.md          # 实验分析报告
+├── student_requirements.txt  # 学生额外依赖（pytest-cov, hypothesis）
+├── pyproject.toml       # coverage 配置（不配全局 cov addopts）
+├── src/                 # 实现（9 模块）
+├── tests/               # 学生自测（unit/property/integration/e2e）
+├── public_tests/        # 教师公开测试（不改）
+└── results/             # 输出（received.txt, metrics.json, 6 张图）
 ```
 
-## 6. 运行方式
+## 9. 运行方式
 
 ```bash
 python main.py --input Test.txt --output results/received.txt \
                --snr 12 --seed 2026 --mod qpsk --channel awgn
 ```
 
-输出：
-- `results/received.txt` — 恢复的文本
-- `results/metrics.json` — 性能指标
-- `results/constellation.png` — QPSK 星座图
-- `results/ber_curve.png` — BER 曲线
-- `results/sync_peak.png` — 同步峰值图
+输出：`results/received.txt`、`results/metrics.json`（含真实 ber/fer/checksum_pass/crc_valid/sync_confidence）、`results/*.png`（6 张图）。

@@ -1,0 +1,4 @@
+# 学生额外依赖 — CI 会自动安装（见 .github/workflows/grading.yml 的 Install dependencies 步骤）
+# 不修改教师提供的 requirements.txt
+pytest-cov
+hypothesis

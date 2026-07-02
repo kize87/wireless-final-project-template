@@ -1,0 +1,27 @@
+# pyproject.toml — 覆盖率配置
+# 注意：不配置 [tool.pytest.ini_options].addopts 的 cov，
+# 否则 CI 跑 `pytest public_tests -q` 时会触发 cov 门禁导致 CI 失败。
+# 覆盖率门禁靠本地命令：pytest tests --cov=src --cov=main --cov-fail-under=90
+
+[tool.coverage.run]
+source = ["src", "main.py"]
+omit = [
+    "*/__init__.py",
+    "*/tests/*",
+    "*/public_tests/*",
+    "*/mock/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
+fail_under = 90
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "public_tests"]
+# 故意不配 addopts 的 cov —— CI 跑 public_tests 不受影响
