@@ -61,3 +61,47 @@ def test_main_in_process(monkeypatch, tmp_path):
     metrics = json.loads((tmp_path / "metrics.json").read_text(encoding="utf-8"))
     assert metrics["text_match_rate"] == 1.0
     assert metrics["crc_valid"] is True
+
+
+def test_main_rejects_extreme_snr(monkeypatch, tmp_path):
+    """invalid_snr 隐藏测试口径：CLI 必须显式拒绝非法 SNR（非零退出）。"""
+    test_file = tmp_path / "Test.txt"
+    test_file.write_text(TEXT, encoding="utf-8")
+    out_file = tmp_path / "received.txt"
+    monkeypatch.setattr(main_mod, "RESULTS_DIR", tmp_path / "results")
+    monkeypatch.setattr("sys.argv", [
+        "main.py", "--input", str(test_file), "--output", str(out_file),
+        "--snr", "-999", "--seed", "2026", "--mod", "qpsk", "--channel", "awgn",
+    ])
+    with pytest.raises(SystemExit) as exc:
+        main_mod.main()
+    assert exc.value.code != 0
+
+
+def test_main_rejects_nonfinite_snr(monkeypatch, tmp_path):
+    """NaN/Inf SNR 必须被拒绝（argparse 的 type=float 会放行 inf/nan，需显式挡）。"""
+    test_file = tmp_path / "Test.txt"
+    test_file.write_text(TEXT, encoding="utf-8")
+    out_file = tmp_path / "received.txt"
+    monkeypatch.setattr(main_mod, "RESULTS_DIR", tmp_path / "results")
+    monkeypatch.setattr("sys.argv", [
+        "main.py", "--input", str(test_file), "--output", str(out_file),
+        "--snr", "inf", "--seed", "2026", "--mod", "qpsk", "--channel", "awgn",
+    ])
+    with pytest.raises(SystemExit) as exc:
+        main_mod.main()
+    assert exc.value.code != 0
+
+
+def test_main_accepts_valid_low_snr(monkeypatch, tmp_path):
+    """合法低 SNR（0 dB，落在扫描范围内）不应被范围校验误杀。"""
+    test_file = tmp_path / "Test.txt"
+    test_file.write_text(TEXT, encoding="utf-8")
+    out_file = tmp_path / "received.txt"
+    monkeypatch.setattr(main_mod, "RESULTS_DIR", tmp_path / "results")
+    monkeypatch.setattr("sys.argv", [
+        "main.py", "--input", str(test_file), "--output", str(out_file),
+        "--snr", "0", "--seed", "2026", "--mod", "qpsk", "--channel", "awgn",
+    ])
+    main_mod.main()  # 不应 raise
+    assert out_file.exists()

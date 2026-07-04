@@ -256,6 +256,13 @@ def main():
     parser.add_argument("--code", type=str, default="rep3", help="信道编码方案")
     args = parser.parse_args()
 
+    # SNR 范围校验（PPT 讲评：invalid_snr 是头号共性扣分点，CLI 必须显式拒绝非法输入）
+    # argparse 的 type=float 已拦截非数值（exit 2），这里再挡 NaN/Inf 与超范围数值。
+    if not np.isfinite(args.snr) or not (-20.0 <= args.snr <= 60.0):
+        print(f"Error: invalid --snr {args.snr!r}, expected finite value in [-20, 60] dB",
+              file=sys.stderr)
+        sys.exit(1)
+
     # 工厂选路（CLI 真正生效，替换原硬编码）
     if args.mod not in MODULATION_SCHEMES:
         print(f"Error: unsupported --mod {args.mod}, available: {list(MODULATION_SCHEMES)}",
